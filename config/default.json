@@ -1,0 +1,28 @@
+{
+  "app": {
+    "id": "",
+    "vendorId": "",
+    "prefix": "sddp:",
+    "maxListQueryLength": 14400,
+    "primarySensor": "",
+    "sensorMetrics": [""],
+    "timeouts": {
+      "ack": 5000,
+      "connect": 1000,
+      "reconnect": 5000
+    },
+    "mainMetricWidth": 4,
+    "samplesPerMinuteRetained": 1,
+    "dayBins": [1, 3, 5, 7],
+    "minDataHoursToRenderBin": 18,
+    "showCurrentValue": {
+      "numSamples": 30,
+      "alternateEvery": 15
+    }
+  },
+  "redisPubSubMetrics": null,
+  "redis": {
+    "host": "",
+    "password": ""
+  }
+}

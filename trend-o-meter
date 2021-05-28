@@ -1,0 +1,532 @@
+#!/usr/bin/env node
+
+const config = require('config');
+const Redis = require('ioredis');
+const uuid = require('uuid').v4;
+const SDDPDisplay = require('sddp-javascript-consumer');
+
+const DEBUG = process.env.DEBUG || false;
+
+const minValInTimeseries = (timeseries) => timeseries.reduce((a, x) => x[1] < a[1] ? x : a, [null, 2e32]);
+const maxValInTimeseries = (timeseries) => timeseries.reduce((a, x) => x[1] > a[1] ? x : a, [null, -2e32]);
+
+const EXEC_START = Date.now();
+
+// assumes `timeseries` is sorted newest-to-oldest
+const minMaxForDayBins = (timeseries, dayBins) => {
+  const curMoment = timeseries[0][0];
+  const dayBinExtentTses = dayBins.map((dayBin) => curMoment - (dayBin * 24 * 60 * 60));
+  if (DEBUG) console.log('dayBinExtentTses', dayBinExtentTses.map(console.unixTimeToISOString));
+
+  let curDBETIdx = 0;
+  let curStartingExtent = 0;
+  let dayBinSliceExtents = timeseries.reduce((a, tsEle, tsIndex) => {
+    if (tsEle[0] < dayBinExtentTses[curDBETIdx]) {
+      if (DEBUG) console.log(`dayBinSliceExtents> slicing at `, console.unixTimeToISOString(tsEle[0]), 'idxs', tsIndex, curDBETIdx)
+      a.push([curStartingExtent, tsIndex]);
+      curStartingExtent = tsIndex;
+      curDBETIdx++;
+    }
+
+    return a;
+  }, []);
+
+  // get the leftover (when there's less-than-a-dayBins-worth of trailing data)
+  if (curStartingExtent < timeseries.length && dayBinSliceExtents.length < dayBins.length && curDBETIdx < dayBins.length) {
+    dayBinSliceExtents.push([curStartingExtent + 1]);
+  }
+
+  if (DEBUG) console.log('dayBinSliceExtents', dayBinSliceExtents);
+
+  return dayBinSliceExtents.reduce((a, sliceExtent, dbIdx) => {
+    const tsSlice = timeseries.slice(...sliceExtent);
+    const min = minValInTimeseries(tsSlice);
+    const max = maxValInTimeseries(tsSlice);
+
+    if (DEBUG) {
+      console.log('slice spec', sliceExtent, 'gets ya', tsSlice.length, 'elements');
+      console.log('slice spans', (tsSlice[0][0] - tsSlice[tsSlice.length - 1][0]) / (24 * 60 * 60), 'days');
+      console.log('min/max:', console.tsTupleWithISOString(min), console.tsTupleWithISOString(max), `(${dbIdx}->${dayBins[dbIdx]})`);
+      console.log('first/last:', console.tsTupleWithISOString(tsSlice[0]), console.tsTupleWithISOString(tsSlice[tsSlice.length - 1]));
+    }
+
+    return {
+      [dayBins[dbIdx]]: {
+        __sliceLength: tsSlice.length,
+        min,
+        max,
+        isComplete: tsSlice.length ? Math.ceil((tsSlice[0][0] - tsSlice[tsSlice.length - 1][0]) / 3600) > config.app.minDataHoursToRenderBin : false
+      },
+      ...a
+    };
+  }, {});
+};
+
+let _console_hdr = () => '<pre>';
+const _console = console;
+const unixTimeToISOString = (unixTime) => new Date(unixTime * 1000).toLocaleString();
+
+const consoleInterposer = {
+  log: (...a) => _console.log(_console_hdr(), ...a),
+  error: (...a) => _console.error(_console_hdr(), ...a),
+  unixTimeToISOString,
+  tsTupleWithISOString: (tsTuple) => [unixTimeToISOString(tsTuple[0]), tsTuple[1]]
+};
+
+console = new Proxy({}, {
+  get: (_target, prop, _rx) => (consoleInterposer.hasOwnProperty(prop) ? consoleInterposer : _console)[prop]
+});
+
+const MAIN_METRIC_LEFT_OFFSET = config.app.mainMetricWidth > 3 ? 6 : 5;
+
+const deVoweled = (str) => [...str].filter(x => ['a', 'e', 'i', 'o', 'u', 'y'].indexOf(x) === -1).join('');
+
+const displayInit = (display, mainMetric) => {
+  display.clear();
+
+  const lineRowLen = ((config.app.dayBins.length * config.app.mainMetricWidth) + MAIN_METRIC_LEFT_OFFSET) - 1;
+  display.writeAt(0, 1, '-'.repeat(lineRowLen));
+
+  const vertLineCol = lineRowLen < 19 ? lineRowLen : 4;
+  for (let row = 0; row < 4; row++) {
+    display.writeAt(vertLineCol, row, '|');
+  }
+
+  display.writeAt(0, 0, deVoweled(mainMetric).substring(0, 3));
+
+  display.writeAt(0, 2, 'Low');
+  display.writeAt(0, 3, 'High');
+
+  config.app.dayBins.forEach((dayBin, i) => display.writeAt(MAIN_METRIC_LEFT_OFFSET + (i * config.app.mainMetricWidth), 0, `${dayBin}d`));
+  
+  if (config.redisPubSubMetrics) {
+    display.writeAt(14, 1, 'M> ...');
+    display.writeAt(14, 2, 'B> ...');
+    display.writeAt(14, 3, 'A> ...');
+  }
+};
+
+const main = async (targetDeviceId) => {
+  _console_hdr = () => `[${new Date().toLocaleString()} - ${targetDeviceId}]`;
+  console.log(`Started with config`, Object.assign({}, config, { redis: '<redacted>' }));
+
+  if (!config.app.id) {
+    config.app.id = `adp-js.${uuid().substring(0, 8)}`;
+    console.log(`Generated ephermal consumer ID "${config.app.id}"`);
+  }
+
+  const metrics = config.app.sensorMetrics;
+
+  if (metrics.length > 1) {
+    throw new Error('nope not anymore!');
+  }
+
+  const mainMetric = metrics[0];
+  console.log(`Tracking ${mainMetric} with sensor "${config.app.primarySensor}"`);
+
+  const reconnects = [];
+  const messageStats = {
+    rx: 0,
+    tx: 0
+  }
+
+  const display = new SDDPDisplay(config.app.id, config.app.prefix, config.redis, { messageStats });
+
+  let rxMsgCount = 0;
+  const timeBetweenSamples = 60 / config.app.samplesPerMinuteRetained;
+
+  try {
+    const listenConn = new Redis(config.redis);
+    const mlc = mainMetric.toLowerCase();
+    const metricExtents = {};
+    let metricHistory = {};
+    let runParse = () => { };
+
+    const rawValRenderers = {
+      temperature: (x) => Number(x).toFixed(0),
+      humidity: (x) => Number(x).toFixed(0),
+      pressure: (x) => String(Number(x).toFixed(0)).slice(-2),
+      mc_2p5: (x) => Number(x).toFixed(0)
+    };
+
+    const renderMainMetric = (display) => {
+      const mms = metricExtents[mlc].minMaxSince;
+      if (DEBUG) console.log(mlc, 'MMS', mms);
+
+      Object.keys(mms).sort().forEach((dayBin, i) => {
+        if (mms[dayBin].isComplete) {
+          display.writeAt(MAIN_METRIC_LEFT_OFFSET + (i * config.app.mainMetricWidth), 2, rawValRenderers[mlc](mms[dayBin].min[1]));
+          display.writeAt(MAIN_METRIC_LEFT_OFFSET + (i * config.app.mainMetricWidth), 3, rawValRenderers[mlc](mms[dayBin].max[1]));
+        }
+      });
+    };
+
+    const c2Conn = new Redis(config.redis);
+    const c2Pub = new Redis(config.redis);
+    const c2chan = `${config.app.prefix}c2:${targetDeviceId}|${config.app.id}`;
+    const c2CmdLog = `${c2chan}:cmdlog`;
+    const c2RespChan = `${c2chan}:resp`;
+
+    c2Conn.on('message', async (_c, message) => {
+      ++messageStats.rx
+      const msgComps = message.split(/\s+/);
+
+      const getters = {
+        config: (_displayRef) => config,
+        stats: async (displayRef) => {
+          let deviceUptime = -1
+          try {
+            deviceUptime = await displayRef.issueCustomCommand('uptime')
+          } catch (iccErr) {
+            console.log(`error querying device uptime:`, iccErr)
+          }
+
+          return {
+            uptime: {
+              app: (Date.now() - EXEC_START) / 1000,
+              display: deviceUptime
+            },
+            reconnects,
+            messages: messageStats
+          }
+        }
+      }
+
+      const executor = {
+        get: (displayRef, field) => {
+          if (getters[field]) {
+            return getters[field](displayRef)
+          }
+        },
+        set: (displayRef, field, newVal) => {
+          if (field === 'minDataHoursToRenderBin') {
+            config.app.minDataHoursToRenderBin = newVal;
+            displayRef.clear();
+            displayInit(displayRef, mainMetric);
+            runParse();
+            renderMainMetric(displayRef);
+          }
+        }
+      }[msgComps[0]];
+
+      let retVal;
+      let error;
+      if (!executor) {
+        console.error(`unknown c2 command "${msgComps[0]}`, message);
+      }
+      else {
+        try {
+          retVal = await executor(display, ...msgComps.slice(1));
+        } catch (err) {
+          console.error(message, 'executor threw', err);
+          error = err.toString();
+        }
+
+        if (retVal) {
+          const strRetVal = JSON.stringify(retVal);
+          // a hash key of the same name as the response channel, with a field name matching the command,
+          // will always contain the last return value as well
+          c2Pub.hset(c2RespChan, msgComps[0], strRetVal);
+          c2Pub.publish(c2RespChan, strRetVal);
+          messageStats.tx++
+        }
+      }
+
+      const cmdLog = {
+        ts: +new Date(),
+        valid: !!executor,
+        message,
+        retVal,
+        error
+      };
+
+      console.log('C2 cmd:', cmdLog);
+      c2Pub.lpush(c2CmdLog, JSON.stringify(cmdLog));
+    });
+
+    c2Conn.subscribe(c2chan, (err) => {
+      if (err) {
+        console.error('double crap', err)
+        throw err;
+      }
+
+      console.log(`Listening for C2 on '${c2chan}'`);
+    });
+
+    if (listenConn) {
+      console.log(`Attempting to connect to ${targetDeviceId}...`);
+
+      await display.connect(targetDeviceId, (expectedSeqNo, currentSeqNo) => {
+        console.error(`Display disconnected! expect=${expectedSeqNo} current=${currentSeqNo}`, reconnects.length);
+      }, (displayRef, estabChan, retryCount) => {
+        reconnects.push(Math.floor(Date.now() / 1e3))
+        console.error('Display reconnected!', reconnects.length, estabChan, retryCount);
+        displayInit(displayRef, mainMetric);
+        renderMainMetric(displayRef);
+      });
+
+      console.log('Connected to', display.displayId);
+
+      // query the redis server for config.app.maxListQueryLength historical data points
+      metricHistory[mlc] = await listenConn.lrange(`${config.app.primarySensor}:${mlc}:.list`, 0, config.app.maxListQueryLength);
+      metricHistory[mlc] = metricHistory[mlc].map((e) => JSON.parse(e));
+
+      if (DEBUG) {
+        Object.keys(metricHistory).forEach((k) => console.log(`Before downsampling '${k}': ${metricHistory[k].length}`));
+      }
+
+      // downsample to config.app.samplesPerMinuteRetained
+      metricHistory = Object.keys(metricHistory).reduce((newHist, metric) => {
+        let timeMark = -1;
+        return {
+          [metric]: metricHistory[metric].filter((ele) => {
+            if (timeMark === -1 || Math.abs(ele[0] - timeMark) > timeBetweenSamples) {
+              timeMark = ele[0];
+              return true;
+            }
+
+            return false;
+          }),
+          ...newHist
+        };
+      }, {});
+
+      if (DEBUG) {
+        Object.keys(metricHistory).forEach((k) => console.log(`After downsampling '${k}': ${metricHistory[k].length}`));
+      }
+
+      runParse = () => {
+        // parse downsampled data points for min/max, earliest/latest and the day bins as configured per config.app.dayBins
+        Object.keys(metricHistory).forEach((mlc) => {
+          if (!metricHistory[mlc].length) {
+            return;
+          }
+
+          const minMaxSince = minMaxForDayBins(metricHistory[mlc], config.app.dayBins);
+
+          metricExtents[mlc] = {
+            minMaxSince,
+            latest: metricHistory[mlc][0][0],
+            earliest: metricHistory[mlc][metricHistory[mlc].length - 1][0]
+          };
+        });
+      };
+
+      runParse();
+
+      display.clear();
+
+      const timeSpanRender = async (msgCount, didProcess, timestamp) => {
+        const tsChar = (msgCount % 2) ? ' ' : (didProcess ? '~' : '*');
+
+        display.writeAt(3, 0, !config.redisPubSubMetrics ? tsChar : (tsChar === '~' ? tsChar : ' '));
+
+        if (config.redisPubSubMetrics) {
+          const [ time, ampm ] = (timestamp ? new Date(timestamp) : new Date()).toLocaleTimeString().split(/\s+/);
+          const [ hour, min, _sec ] = time.split(':');
+          display.writeAt(14, 0, `${hour.padStart(2)}${tsChar === ' ' ? ' ' : ':'}${min.padStart(2)}${ampm.substring(0, 1)}`);
+        }
+        
+        if (config.app.showCurrentValue) {
+          let renderStr;
+
+          if (config.app.showCurrentValue.alternateEvery) {
+            if (!config.app.showCurrentValue.__altEvCounter) {
+              config.app.showCurrentValue.__altEvCounter = config.app.showCurrentValue.alternateEvery;
+
+              if (!config.app.showCurrentValue.__altEvStaticStr) {
+                config.app.showCurrentValue.__altEvStaticStr = deVoweled(mainMetric).substring(0, 3);
+              } else {
+                config.app.showCurrentValue.__altEvStaticStr = null;
+              }
+            }
+
+            config.app.showCurrentValue.__altEvCounter--;
+          }
+
+          // fram before the flip, ease the visual transition
+          if (!config.app.showCurrentValue.__altEvCounter) {
+            renderStr = ' - ';
+          } else if (!config.app.showCurrentValue.__altEvStaticStr) {
+            const avgSliceLen =  metricHistory[mlc].length > config.app.showCurrentValue.numSamples ? config.app.showCurrentValue.numSamples : metricHistory[mlc].length - 1;
+            const curAvg = metricHistory[mlc].slice(0, avgSliceLen).reduce((a, x) => a + x[1], 0) / avgSliceLen;
+            renderStr = String(rawValRenderers[mlc](curAvg).padEnd(3));
+          } else {
+            renderStr = config.app.showCurrentValue.__altEvStaticStr;
+          }
+
+          display.writeAt(0, 0, renderStr);
+        }
+      };
+
+      let timeMark = 0;
+      let collectedSamples = [];
+      listenConn.on('pmessage', (_p, _c, message) => {
+        ++messageStats.rx
+        try {
+          let msgObj = JSON.parse(message);
+
+          const willProcess = Math.abs(msgObj.ts - timeMark) > timeBetweenSamples;
+          timeSpanRender(rxMsgCount, willProcess, msgObj.ts * 1000);
+
+          ++rxMsgCount;
+          collectedSamples.push(msgObj);
+
+          if (willProcess) {
+            // mutates the current data point to represent the mean of the collected samples, without modifying other
+            // datum such as timestamps (so as to remain "current")
+            msgObj = Object.keys(metricExtents).reduce((a, metric) => {
+              a.value[metric] = collectedSamples.reduce((a, sample) => a + sample.value[metric], 0) / collectedSamples.length;
+              return a;
+            }, msgObj);
+
+            if (DEBUG) console.log(`!! Processing ${msgObj.ts} from ${collectedSamples.length} samples (delta: ${Math.abs(msgObj.ts - timeMark)})`);
+            timeMark = msgObj.ts;
+
+            if (msgObj.source === config.app.primarySensor) {
+              Object.keys(metricExtents).forEach((metric) => {
+                const val = msgObj.value[metric];
+                const meRef = metricExtents[metric];
+
+                meRef.latest = msgObj.ts;
+                const metricObj = [meRef.latest, val];
+                metricHistory[metric].unshift(metricObj);
+              });
+
+              runParse();
+              renderMainMetric(display);
+
+              if (metricExtents[mlc].latest - metricExtents[mlc].earliest >
+                (config.app.dayBins[config.app.dayBins.length - 1] * 24 * 60 * 60)) {
+                if (DEBUG) console.log(`past the mark! must cull ${metricExtents[mlc].earliest}`);
+                Object.keys(metricExtents).forEach((metric) => {
+                  const culled = metricHistory[metric].pop();
+                  if (DEBUG) {
+                    console.log(`culling`, culled);
+                    console.log(`new earliest`, metricHistory[metric][metricHistory[metric].length - 1]);
+                  }
+                  metricExtents[metric].earliest = metricHistory[metric][metricHistory[metric].length - 1][0];
+                });
+
+                if (DEBUG) console.log('NOW', metricExtents);
+                Object.keys(metricHistory).forEach((k) => console.log(`NOW ${k}: ${metricHistory[k].length}`));
+              }
+            }
+
+            collectedSamples = [];
+          }
+        } catch (error) {
+          console.log(`Bad message! "${message}"`);
+          console.log(error);
+        }
+      });
+
+      listenConn.psubscribe(config.app.primarySensor, (err) => {
+        if (err) {
+          console.error('crap', err)
+          throw err;
+        }
+
+        if (config.redisPubSubMetrics) {
+          const rCfg = config.redisPubSubMetrics;
+          const allMsgsConn = new Redis(config.redis);
+          let msgsPerSecondTracker = {};
+          let activeChannelsTracker = {};
+          let rpsHandle;
+
+          const renderRedisPubSubMetrics = () => {
+            clearTimeout(rpsHandle);
+            rpsHandle = setTimeout(() => {
+              // start display MPS when at least half the window is full
+              if (Object.keys(msgsPerSecondTracker).length > (rCfg.mpsWindowSizeSeconds / 2)) {
+                const vals = Object.values(msgsPerSecondTracker);
+                display.writeAt(16, 1, String(Number((vals.reduce((a, x) => a + x.count, 0) / rCfg.mpsWindowSizeSeconds)).toFixed(1)).padStart(4));
+                display.writeAt(16, 2, String(Number((vals.reduce((a, x) => a + x.bytes, 0) / rCfg.mpsWindowSizeSeconds)).toFixed(0)).padStart(4));
+              }
+
+              const now = Date.now();
+              activeChannelsTracker = Object.entries(activeChannelsTracker).reduce((a, x) => {
+                if (((now - x[1]) / 1000) < rCfg.channelInactiveCutoffSeconds) {
+                  a[x[0]] = x[1];
+                } else {
+                  console.log(`channel '${x[0]}' (last active: ${x[1]}, delta: ${(now - x[1]) / 1000}s) went inactive; removing`)
+                }
+
+                return a;
+              }, {});
+
+              display.writeAt(16, 3, String(Object.keys(activeChannelsTracker).length).padStart(4));
+
+              renderRedisPubSubMetrics();
+            }, 1000 * rCfg.renderEverySeconds);
+          };
+          
+          messageStats.redisPubSub = { rx: 0 }
+
+          allMsgsConn.on('pmessage', (_p, channel, message) => {
+            messageStats.redisPubSub.rx++
+            const tsSecs = Math.floor(Date.now() / 1000);
+            if (!msgsPerSecondTracker[tsSecs]) {
+              msgsPerSecondTracker[tsSecs] = { count: 0, bytes: 0 };
+            }
+
+            msgsPerSecondTracker[tsSecs].count++;
+            msgsPerSecondTracker[tsSecs].bytes += message.length;
+
+            if (msgsPerSecondTracker[tsSecs - rCfg.mpsWindowSizeSeconds]) {
+              delete msgsPerSecondTracker[tsSecs - rCfg.mpsWindowSizeSeconds];
+            }
+
+            if (Object.keys(msgsPerSecondTracker).length > rCfg.mpsWindowSizeSeconds) {
+              let contig;
+              Object.keys(msgsPerSecondTracker).map((x) => Number.parseInt(x)).sort().forEach((x) => {
+                if (!contig || x === contig + 1) {
+                  contig = x;
+                }
+              });
+              
+              const lenBefore = Object.keys(msgsPerSecondTracker).length;
+              msgsPerSecondTracker = Object.entries(msgsPerSecondTracker).reduce((a, x) => {
+                if (Number.parseInt(x[0]) > contig) {
+                  return { [x[0]]: x[1], ...a };
+                }
+                return a;
+              }, {});
+
+              console.error('fixed MPS gap at', contig, 'removed', lenBefore - Object.keys(msgsPerSecondTracker).length);
+            }
+
+            if (!activeChannelsTracker[channel]) {
+              console.log(`added active channel #${Object.keys(activeChannelsTracker).length + 1} '${channel}'`);
+            }
+
+            activeChannelsTracker[channel] = Date.now();
+          });
+
+          allMsgsConn.psubscribe('*', (err) => {
+            if (err) {
+              console.error('other crap', err)
+              throw err;
+            }
+
+            renderRedisPubSubMetrics();
+          });
+        }
+
+        displayInit(display, mainMetric);
+        timeSpanRender();
+      });
+    }
+  } catch (error) {
+    console.error('Connect error:', error);
+
+    if (error.wasFatal) {
+      console.error('Above was fatal; exiting.');
+      process.exit(-1);
+    }
+  }
+};
+
+(async () => {
+  main(config.app.vendorId || process.argv.pop());
+})();

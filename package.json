@@ -1,0 +1,25 @@
+{
+  "name": "trend-o-meter",
+  "version": "1.0.0",
+  "description": "The timeseries data Trend-o-Meter",
+  "main": "trend-o-meter",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rpj/trend-o-meter.git"
+  },
+  "author": "Ryan Joseph <ryan@electricsheep.co>",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/rpj/trend-o-meter/issues"
+  },
+  "homepage": "https://github.com/rpj/trend-o-meter#readme",
+  "dependencies": {
+    "config": "3.3.6",
+    "ioredis": "4.27.1",
+    "uuid": "8.3.2",
+    "sddp-javascript-consumer": "sdd-protocol/javascript-consumer"
+  }
+}
