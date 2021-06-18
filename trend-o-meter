@@ -1,11 +1,10 @@
-#!/usr/bin/env node
-
 const config = require('config');
 const Redis = require('ioredis');
 const uuid = require('uuid').v4;
 const SDDPDisplay = require('sddp-javascript-consumer');
 
-const DEBUG = process.env.DEBUG || false;
+let DEBUG = process.env.DEBUG || false;
+let LOG_MSGS = process.env.LOG_MSGS || false;
 
 const minValInTimeseries = (timeseries) => timeseries.reduce((a, x) => x[1] < a[1] ? x : a, [null, 2e32]);
 const maxValInTimeseries = (timeseries) => timeseries.reduce((a, x) => x[1] > a[1] ? x : a, [null, -2e32]);
@@ -192,6 +191,17 @@ const main = async (targetDeviceId) => {
         }
       }
 
+      const toBool = (x) => {
+        if (typeof x === 'string') {
+          let xNumber = Number.parseInt(x);
+          if (isNaN(xNumber)) {
+            return x.toLowerCase() === 'true';
+          }
+          return !!xNumber.valueOf();
+        }
+        return !!x;
+      };
+
       const executor = {
         get: (displayRef, field) => {
           if (getters[field]) {
@@ -205,6 +215,12 @@ const main = async (targetDeviceId) => {
             displayInit(displayRef, mainMetric);
             runParse();
             renderMainMetric(displayRef);
+          }
+          else if (field === 'debug') {
+            DEBUG = toBool(newVal);
+          }
+          else if (field === 'logMsgs' || field === 'logMessages') {
+            LOG_MSGS = toBool(newVal);
           }
         }
       }[msgComps[0]];
@@ -371,6 +387,10 @@ const main = async (targetDeviceId) => {
 
           ++rxMsgCount;
           collectedSamples.push(msgObj);
+
+          if (LOG_MSGS) {
+            console.log(`Rx'ed message #${rxMsgCount}: ${JSON.stringify(msgObj, null, 2)}`);
+          }
 
           if (willProcess) {
             // mutates the current data point to represent the mean of the collected samples, without modifying other
